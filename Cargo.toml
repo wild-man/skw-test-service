@@ -1,0 +1,9 @@
+[package]
+name = "skw-test-service"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
