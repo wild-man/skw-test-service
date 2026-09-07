@@ -1,17 +1,22 @@
 // Closed-loop HTTP load generator for the api-gate. Fires requests from a fixed
 // pool of concurrent workers for a fixed duration and reports throughput/latency.
 //
-// Defaults reproduce the sample QUERY /ping curl call as-is. The gate verifies
-// PAYLOAD-SIGNATURE against the raw request body bytes only (no ts/nonce replay
-// check), so the same signed body can be reused for every request.
+// Two scenarios, selected with --scenario:
+//   plain  (default) - GET with no body, no auth headers.
+//   signed            - QUERY with a freshly built {"Ts":...,"Method":"Ping","Params":{}}
+//                        body, ed25519-signed on every single request (signing cost is
+//                        included in measured latency). Requires API_KEY (an entity uuid)
+//                        and PRIVATE_KEY (that entity's bare-base64 PKCS#8 DER private key,
+//                        same format as stored in the auth service's `entities` table) to
+//                        be set as environment variables.
 //
 // Usage:
-//   cargo run --release --bin bench -- \
-//     --url https://localhost:8443/ping/ \
-//     --method QUERY \
-//     --api-key 01a01500-98d5-71fc-9038-71acb78d61c4 \
-//     --signature "nmivI6Z9v9bGpGnhIfUUxsTwH+u/WMEJOhy60tQG/IVFBgPb4DKUnA3Ub2R1HvgAOG2R2DaXcBgNSF8XHkn6Dw==" \
-//     --body '{"Ts":"2026-08-25T12:49:50.264895652Z", "Method":"Ping", "Params":{}}' \
+//   cargo run --release --bin bench -- --scenario plain --url https://localhost:8443/ping/ \
+//     --concurrency 50 --duration 30
+//
+//   API_KEY=01a01500-98d5-71fc-9038-71acb78d61c4 \
+//   PRIVATE_KEY=MC4CAQAwBQYDK2VwBCIEIBciTyz1f9ELrN3rZ+tcxxvQa14krR0sxY6HTJOLcWbK \
+//     cargo run --release --bin bench -- --scenario signed --url https://localhost:8443/ping/ \
 //     --concurrency 50 --duration 30
 
 use std::{
@@ -23,14 +28,42 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::prelude::*;
+use chrono::{SecondsFormat, Utc};
+use ed25519_dalek::{Signer, SigningKey, pkcs8::DecodePrivateKey};
 use reqwest::Method;
 use tokio::sync::Mutex;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Plain,
+    Signed,
+}
+
+impl Scenario {
+    fn parse(s: &str) -> Self {
+        match s {
+            "plain" => Scenario::Plain,
+            "signed" => Scenario::Signed,
+            other => {
+                eprintln!("invalid --scenario {other}: expected \"plain\" or \"signed\"");
+                exit(1);
+            }
+        }
+    }
+
+    fn default_method(self) -> &'static str {
+        match self {
+            Scenario::Plain => "GET",
+            Scenario::Signed => "QUERY",
+        }
+    }
+}
+
 struct Args {
     url: String,
-    method: String,
-    api_key: Option<String>,
-    signature: Option<String>,
+    method: Option<String>,
+    scenario: Scenario,
     body: Option<String>,
     concurrency: usize,
     duration: Duration,
@@ -39,22 +72,10 @@ struct Args {
 
 impl Default for Args {
     fn default() -> Self {
-        // Self {
-        //     url: "https://localhost:8443/ping/".into(),
-        //     method: "QUERY".into(),
-        //     api_key: Some("01a01500-98d5-71fc-9038-71acb78d61c4".into()),
-        //     signature: Some("nmivI6Z9v9bGpGnhIfUUxsTwH+u/WMEJOhy60tQG/IVFBgPb4DKUnA3Ub2R1HvgAOG2R2DaXcBgNSF8XHkn6Dw==".into()),
-        //     body: Some(r#"{"Ts":"2026-08-25T12:49:50.264895652Z", "Method":"Ping", "Params":{}}"#.into()),
-        //     concurrency: 50,
-        //     duration: Duration::from_secs(100),
-        //     insecure: true,
-        // }
-
         Self {
             url: "https://localhost:8443/ping/".into(),
-            method: "GET".into(),
-            api_key: None,
-            signature: None,
+            method: None,
+            scenario: Scenario::Plain,
             body: None,
             concurrency: 50,
             duration: Duration::from_secs(100),
@@ -77,9 +98,8 @@ fn parse_args() -> Args {
 
         match flag.as_str() {
             "--url" => args.url = next(),
-            "--method" => args.method = next(),
-            "--api-key" => args.api_key = Some(next()),
-            "--signature" => args.signature = Some(next()),
+            "--method" => args.method = Some(next()),
+            "--scenario" => args.scenario = Scenario::parse(&next()),
             "--body" => args.body = Some(next()),
             "--body-file" => args.body = Some(std::fs::read_to_string(next()).expect("failed to read --body-file")),
             "--concurrency" => args.concurrency = next().parse().expect("--concurrency must be a number"),
@@ -87,8 +107,11 @@ fn parse_args() -> Args {
             "--insecure" => args.insecure = next().parse().expect("--insecure must be true/false"),
             "-h" | "--help" => {
                 println!(
-                    "usage: bench --url <url> [--method QUERY] [--api-key <uuid>] [--signature <base64>]\n\
-                     \x20      [--body <json> | --body-file <path>] [--concurrency N] [--duration SECS] [--insecure true|false]"
+                    "usage: bench --scenario plain|signed [--url <url>] [--method <verb>]\n\
+                     \x20      [--body <json> | --body-file <path>] (plain scenario only)\n\
+                     \x20      [--concurrency N] [--duration SECS] [--insecure true|false]\n\
+                     \n\
+                     signed scenario requires API_KEY and PRIVATE_KEY environment variables."
                 );
                 exit(0);
             }
@@ -99,7 +122,50 @@ fn parse_args() -> Args {
         }
     }
 
+    if args.scenario == Scenario::Signed && args.body.is_some() {
+        eprintln!("--body/--body-file cannot be combined with --scenario signed: the signed body is always generated internally so it matches what gets signed");
+        exit(1);
+    }
+
     args
+}
+
+/// Key material for the signed scenario, loaded once from env vars at startup.
+struct SignedAuth {
+    api_key: String,
+    signing_key: SigningKey,
+}
+
+impl SignedAuth {
+    fn from_env() -> Self {
+        let api_key = std::env::var("API_KEY").unwrap_or_else(|_| {
+            eprintln!("API_KEY env var is required for --scenario signed");
+            exit(1);
+        });
+        let private_key = std::env::var("PRIVATE_KEY").unwrap_or_else(|_| {
+            eprintln!("PRIVATE_KEY env var is required for --scenario signed");
+            exit(1);
+        });
+        let private_key_der = BASE64_STANDARD.decode(private_key.as_bytes()).unwrap_or_else(|e| {
+            eprintln!("PRIVATE_KEY is not valid base64: {e}");
+            exit(1);
+        });
+        let signing_key = SigningKey::from_pkcs8_der(&private_key_der).unwrap_or_else(|e| {
+            eprintln!("PRIVATE_KEY is not a valid PKCS#8 DER ed25519 key: {e}");
+            exit(1);
+        });
+
+        Self { api_key, signing_key }
+    }
+
+    /// Builds a fresh Ping envelope and signs it, for use on a single request.
+    fn sign_fresh_ping_body(&self) -> (String, String) {
+        let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let body = format!(r#"{{"Ts":"{ts}","Method":"Ping","Params":{{}}}}"#);
+        let signature = self.signing_key.sign(body.as_bytes());
+        let sig_b64 = BASE64_STANDARD.encode(signature.to_bytes());
+        (body, sig_b64)
+    }
 }
 
 struct WorkerStats {
@@ -111,7 +177,13 @@ struct WorkerStats {
 async fn main() {
     let args = parse_args();
 
-    let method = Method::from_bytes(args.method.as_bytes()).expect("invalid HTTP method");
+    let method_str = args.method.clone().unwrap_or_else(|| args.scenario.default_method().to_string());
+    let method = Method::from_bytes(method_str.as_bytes()).expect("invalid HTTP method");
+
+    let signed_auth = match args.scenario {
+        Scenario::Plain => None,
+        Scenario::Signed => Some(Arc::new(SignedAuth::from_env())),
+    };
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(args.insecure)
@@ -119,9 +191,10 @@ async fn main() {
         .expect("failed to build http client");
 
     println!(
-        "benchmarking {} {} | concurrency={} duration={}s",
-        args.method,
+        "benchmarking {} {} | scenario={} concurrency={} duration={}s",
+        method_str,
         args.url,
+        if args.scenario == Scenario::Signed { "signed" } else { "plain" },
         args.concurrency,
         args.duration.as_secs()
     );
@@ -135,9 +208,8 @@ async fn main() {
         let client = client.clone();
         let method = method.clone();
         let url = args.url.clone();
-        let api_key = args.api_key.clone();
-        let signature = args.signature.clone();
         let body = args.body.clone();
+        let signed_auth = signed_auth.clone();
         let sent = sent.clone();
         let results = results.clone();
 
@@ -152,15 +224,14 @@ async fn main() {
                 let mut req = client
                     .request(method.clone(), &url)
                     .header("Content-Type", "application/json");
-                if let Some(api_key) = &api_key {
-                    req = req.header("API-KEY", api_key);
-                }
-                if let Some(signature) = &signature {
-                    req = req.header("PAYLOAD-SIGNATURE", signature);
-                }
-                if let Some(body) = &body {
+
+                if let Some(auth) = &signed_auth {
+                    let (body, sig_b64) = auth.sign_fresh_ping_body();
+                    req = req.header("API-KEY", &auth.api_key).header("PAYLOAD-SIGNATURE", sig_b64).body(body);
+                } else if let Some(body) = &body {
                     req = req.body(body.clone());
                 }
+
                 let resp = req.send().await;
 
                 let elapsed = start.elapsed();
@@ -239,7 +310,7 @@ fn report(all: Vec<WorkerStats>, duration: Duration) {
     println!();
     println!("status breakdown:");
     let mut entries: Vec<_> = status_counts.into_iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.1));
     for (status, count) in entries {
         println!("  {status:<12} {count}");
     }
