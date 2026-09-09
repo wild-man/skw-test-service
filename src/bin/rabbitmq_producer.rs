@@ -89,9 +89,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-    for i in 0..args.count {
+    for i in 1..=args.count {
         let task = PingTask {
-            message: format!("{} #{}", args.message, i + 1),
+            message: format!("{} #{}", args.message, i),
         };
         let payload = serde_json::to_string(&task)?;
 
