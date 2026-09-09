@@ -123,7 +123,9 @@ fn parse_args() -> Args {
     }
 
     if args.scenario == Scenario::Signed && args.body.is_some() {
-        eprintln!("--body/--body-file cannot be combined with --scenario signed: the signed body is always generated internally so it matches what gets signed");
+        eprintln!(
+            "--body/--body-file cannot be combined with --scenario signed: the signed body is always generated internally so it matches what gets signed"
+        );
         exit(1);
     }
 
@@ -146,16 +148,21 @@ impl SignedAuth {
             eprintln!("PRIVATE_KEY env var is required for --scenario signed");
             exit(1);
         });
-        let private_key_der = BASE64_STANDARD.decode(private_key.as_bytes()).unwrap_or_else(|e| {
-            eprintln!("PRIVATE_KEY is not valid base64: {e}");
-            exit(1);
-        });
+        let private_key_der = BASE64_STANDARD
+            .decode(private_key.as_bytes())
+            .unwrap_or_else(|e| {
+                eprintln!("PRIVATE_KEY is not valid base64: {e}");
+                exit(1);
+            });
         let signing_key = SigningKey::from_pkcs8_der(&private_key_der).unwrap_or_else(|e| {
             eprintln!("PRIVATE_KEY is not a valid PKCS#8 DER ed25519 key: {e}");
             exit(1);
         });
 
-        Self { api_key, signing_key }
+        Self {
+            api_key,
+            signing_key,
+        }
     }
 
     /// Builds a fresh Ping envelope and signs it, for use on a single request.
@@ -177,7 +184,10 @@ struct WorkerStats {
 async fn main() {
     let args = parse_args();
 
-    let method_str = args.method.clone().unwrap_or_else(|| args.scenario.default_method().to_string());
+    let method_str = args
+        .method
+        .clone()
+        .unwrap_or_else(|| args.scenario.default_method().to_string());
     let method = Method::from_bytes(method_str.as_bytes()).expect("invalid HTTP method");
 
     let signed_auth = match args.scenario {
@@ -194,7 +204,11 @@ async fn main() {
         "benchmarking {} {} | scenario={} concurrency={} duration={}s",
         method_str,
         args.url,
-        if args.scenario == Scenario::Signed { "signed" } else { "plain" },
+        if args.scenario == Scenario::Signed {
+            "signed"
+        } else {
+            "plain"
+        },
         args.concurrency,
         args.duration.as_secs()
     );
@@ -227,7 +241,10 @@ async fn main() {
 
                 if let Some(auth) = &signed_auth {
                     let (body, sig_b64) = auth.sign_fresh_ping_body();
-                    req = req.header("API-KEY", &auth.api_key).header("PAYLOAD-SIGNATURE", sig_b64).body(body);
+                    req = req
+                        .header("API-KEY", &auth.api_key)
+                        .header("PAYLOAD-SIGNATURE", sig_b64)
+                        .body(body);
                 } else if let Some(body) = &body {
                     req = req.body(body.clone());
                 }
