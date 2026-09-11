@@ -1,0 +1,9 @@
+{
+  "name": "skw-ws-manual-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Manual test scripts for gates/ws — not part of the Cargo workspace.",
+  "dependencies": {
+    "ws": "^8"
+  }
+}
