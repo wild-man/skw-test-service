@@ -114,7 +114,7 @@ ws.on('message', (data) => {
     authorized = true;
     console.log('[04] authorized — starting periodic RpcMethod::Ping requests');
     rpcPingTimer = setInterval(() => {
-      const msg = buildTrackedMessage('Ping', {}, '/bla_bla_bal');
+      const msg = buildTrackedMessage('Pping', {}, '/ping');
       console.log('[04] sending real RpcMethod::Ping request', msg);
       ws.send(msg);
     }, RPC_PING_INTERVAL_MS);
