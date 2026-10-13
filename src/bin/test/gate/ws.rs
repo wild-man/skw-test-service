@@ -89,33 +89,50 @@ impl Gate for WsGate {
 }
 
 impl WsGate {
-    /// Signs `method` with this client's credentials, sends it to any `uri` and waits for the reply.
-    /// Without credentials the frame's `Signature` is just a fresh request id (accepted on public/open topics).
+    /// Sends `method` to any `uri` and waits for its reply.
     pub async fn request<M: Serialize>(&mut self, uri: &str, method: &M) -> GateReply {
+        let id = self.send_request(uri, method).await;
+        self.wait_reply(&id).await
+    }
+
+    /// Unsigned request with a caller-chosen request id, for id-collision cases.
+    pub async fn request_with_id<M: Serialize>(&mut self, uri: &str, method: &M, request_id: &str) -> GateReply {
+        self.send_frame(uri, &gate_body(method), request_id).await;
+        self.wait_reply(request_id).await
+    }
+
+    /// Signs `method` with this client's credentials and sends it without waiting for the reply;
+    /// returns the request id to pass to [`Self::wait_reply`]. Without credentials the frame's
+    /// `Signature` is just a fresh request id (accepted on public/open topics).
+    pub async fn send_request<M: Serialize>(&mut self, uri: &str, method: &M) -> String {
         let data = gate_body(method);
         let signature = match self.auth.identity() {
             Some((_, signer)) => signer.sign(&data),
             None => Uuid::now_v7().to_string(),
         };
-        self.send(uri, &data, &signature).await
+        self.send_frame(uri, &data, &signature).await;
+        signature
     }
 
-    /// Unsigned request with a caller-chosen request id, for id-collision cases.
-    pub async fn request_with_id<M: Serialize>(&mut self, uri: &str, method: &M, request_id: &str) -> GateReply {
-        self.send(uri, &gate_body(method), request_id).await
-    }
-
-    async fn send(&mut self, uri: &str, data: &str, signature: &str) -> GateReply {
-        if let Some(rejected) = &self.rejected {
-            return rejected.clone();
+    async fn send_frame(&mut self, uri: &str, data: &str, signature: &str) {
+        // a rejected connection is closed; `wait_reply` reports the rejection
+        if self.rejected.is_some() {
+            return;
         }
-
         self.conn
             .send_text(ws_frame(Some(uri), &self.auth.wire_body(data), signature))
             .await
             .expect("ws send failed");
+    }
 
-        match self.conn.reply(signature).await {
+    /// Waits for the reply to request `id`; replies to other requests arriving meanwhile are
+    /// buffered, so replies can be collected in any order.
+    pub async fn wait_reply(&mut self, id: &str) -> GateReply {
+        if let Some(rejected) = &self.rejected {
+            return rejected.clone();
+        }
+
+        match self.conn.reply(id).await {
             Ok(v) => into_reply(v),
             Err(e) => {
                 let rejected = rejection(e);
