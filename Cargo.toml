@@ -3,6 +3,21 @@ name = "skw-test-service"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+autobins = false
+
+# shared helpers of both binaries (cfg/services.json, service configs)
+[lib]
+path = "src/lib.rs"
+
+# spawns all services from cfg/services.json, prefixes their output, stops them on Ctrl-C
+[[bin]]
+name = "run"
+path = "src/bin/run.rs"
+
+# runs the integration tests of this binary via `cargo test --bin test`
+[[bin]]
+name = "test"
+path = "src/bin/test/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
@@ -10,7 +25,12 @@ reqwest = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-lapin = { workspace = true }
+serde = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+# explicit crypto backend for the ws client's TLS config
+rustls = { workspace = true, features = ["ring"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-skw-lib-task-protos = { workspace = true }
+skw-lib-shared = { workspace = true }
+skw-lib-http-protos = { workspace = true }

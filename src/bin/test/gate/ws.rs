@@ -1,0 +1,319 @@
+//! `ws` gate provider: one connection per client (`wss://.../ws/`).
+//!
+//! Protocol (see gates/ws/src/ws.rs):
+//! - every frame: `{"Signature": ..., "Uri": "/{service}/{topic_type}", "Data": {"Ts", "Method", "Params"}}`;
+//!   the topic type is chosen only by `Uri`
+//! - public/open topics: no authorization needed, `Signature` is just a client-chosen request id
+//! - signed topics: the connection must first send `Authorize { ApiKey }` (no `Uri`) → `{"Authorized": true}`,
+//!   then every frame carries the b64 ed25519 signature of `Data`; otherwise the gate closes the
+//!   connection with policy code 1008 "Unauthorized"
+//! - replies: `{"Signature", "ErrorMsg", "ErrCode", "Payload"}`, correlated by the frame's `Signature`;
+//!   `ErrCode` is the HTTP status the api gate answers in the same case
+//! - the gate drops a client silent for `clientTimeoutSecs` (10s); pings are answered
+//!   automatically only while the client is reading (i.e. inside a request)
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use reqwest::StatusCode;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use serde::Serialize;
+use serde_json::{Value, json};
+use skw_lib_shared::prelude::uuid::Uuid;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+
+use super::{Auth, Gate, GateReply};
+use crate::common::{gate_body, ws_gate_url};
+
+const WS_PATH: &str = "/ws/";
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSE_POLICY: u16 = 1008;
+
+pub struct WsGate {
+    conn: WsConn,
+    auth: Auth,
+    /// set once the gate closed the connection on auth grounds; every later call returns it
+    rejected: Option<GateReply>,
+}
+
+impl Gate for WsGate {
+    /// Connects and, if `auth` carries an identity, authorizes right away.
+    async fn client(auth: Auth) -> Self {
+        let mut gate = WsGate {
+            conn: WsConn::connect().await,
+            auth,
+            rejected: None,
+        };
+
+        if let Some((id, signer)) = gate.auth.identity() {
+            // the Authorize frame itself is never tampered: TamperedBody breaks later requests only
+            let data = gate_body(&json!({ "Method": "Authorize", "Params": { "ApiKey": id } }));
+            gate.conn
+                .send_text(ws_frame(None, &data, &signer.sign(&data)))
+                .await
+                .expect("ws send failed");
+
+            match gate.conn.recv().await {
+                Ok(v) if v.get("Authorized") == Some(&Value::Bool(true)) => {}
+                Ok(v) => panic!("unexpected authorize reply: {v}"),
+                Err(e) => gate.rejected = Some(rejection(e)),
+            }
+        }
+        gate
+    }
+
+    /// The client itself sends the `Public` method (the http gate injects it).
+    async fn public(&mut self, service: &str) -> GateReply {
+        self.request(
+            &format!("/{service}/public"),
+            &json!({ "Method": "Public", "Params": {} }),
+        )
+        .await
+    }
+
+    async fn open<M: Serialize>(&mut self, service: &str, method: &M) -> GateReply {
+        self.request(&format!("/{service}/open"), method).await
+    }
+
+    async fn signed<M: Serialize>(&mut self, service: &str, method: &M) -> GateReply {
+        self.request(&format!("/{service}/signed"), method).await
+    }
+}
+
+impl WsGate {
+    /// Signs `method` with this client's credentials, sends it to any `uri` and waits for the reply.
+    /// Without credentials the frame's `Signature` is just a fresh request id (accepted on public/open topics).
+    pub async fn request<M: Serialize>(&mut self, uri: &str, method: &M) -> GateReply {
+        let data = gate_body(method);
+        let signature = match self.auth.identity() {
+            Some((_, signer)) => signer.sign(&data),
+            None => Uuid::now_v7().to_string(),
+        };
+        self.send(uri, &data, &signature).await
+    }
+
+    /// Unsigned request with a caller-chosen request id, for id-collision cases.
+    pub async fn request_with_id<M: Serialize>(&mut self, uri: &str, method: &M, request_id: &str) -> GateReply {
+        self.send(uri, &gate_body(method), request_id).await
+    }
+
+    async fn send(&mut self, uri: &str, data: &str, signature: &str) -> GateReply {
+        if let Some(rejected) = &self.rejected {
+            return rejected.clone();
+        }
+
+        self.conn
+            .send_text(ws_frame(Some(uri), &self.auth.wire_body(data), signature))
+            .await
+            .expect("ws send failed");
+
+        match self.conn.reply(signature).await {
+            Ok(v) => into_reply(v),
+            Err(e) => {
+                let rejected = rejection(e);
+                self.rejected = Some(rejected.clone());
+                rejected
+            }
+        }
+    }
+}
+
+fn into_reply(v: Value) -> GateReply {
+    let status = v
+        .get("ErrCode")
+        .and_then(Value::as_u64)
+        .map(|c| {
+            u16::try_from(c)
+                .ok()
+                .and_then(|c| StatusCode::from_u16(c).ok())
+                .unwrap_or_else(|| panic!("invalid ErrCode in {v}"))
+        })
+        .unwrap_or(StatusCode::OK);
+    GateReply {
+        status,
+        error_msg: v
+            .get("ErrorMsg")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        payload: v.get("Payload").cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// Close 1008 is how the ws gate refuses credentials: reported as 403, like the api gate.
+fn rejection(e: WsError) -> GateReply {
+    match e {
+        WsError::Closed {
+            code: Some(CLOSE_POLICY),
+            reason,
+        } => GateReply {
+            status: StatusCode::FORBIDDEN,
+            error_msg: Some(reason),
+            payload: Value::Null,
+        },
+        WsError::Closed { code, reason } => panic!("ws gate closed the connection: {code:?} {reason}"),
+        WsError::Timeout => panic!("ws gate did not reply within {REPLY_TIMEOUT:?}"),
+        WsError::Transport(msg) => panic!("ws transport error: {msg}"),
+    }
+}
+
+/// Raw frame text. `data` is embedded verbatim as `Data`: it must be byte-identical to what was signed.
+pub fn ws_frame(uri: Option<&str>, data: &str, signature: &str) -> String {
+    let uri = uri.map_or(String::new(), |u| format!(r#","Uri":{}"#, json!(u)));
+    format!(r#"{{"Signature":{}{uri},"Data":{data}}}"#, json!(signature))
+}
+
+#[derive(Debug)]
+enum WsError {
+    Closed { code: Option<u16>, reason: String },
+    Timeout,
+    Transport(String),
+}
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct WsConn {
+    stream: WsStream,
+    /// text frames received while waiting for another reply
+    inbox: VecDeque<Value>,
+}
+
+impl WsConn {
+    async fn connect() -> Self {
+        let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(ws_gate_url(WS_PATH), None, false, Some(tls_connector()))
+            .await
+            .expect("ws connect failed");
+        WsConn {
+            stream,
+            inbox: VecDeque::new(),
+        }
+    }
+
+    async fn send_text(&mut self, text: String) -> Result<(), WsError> {
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(|e| WsError::Transport(e.to_string()))
+    }
+
+    /// Waits for the reply carrying `signature`; other frames are kept for later `recv` calls.
+    async fn reply(&mut self, signature: &str) -> Result<Value, WsError> {
+        let matches = |v: &Value| v.get("Signature").and_then(Value::as_str) == Some(signature);
+
+        if let Some(i) = self.inbox.iter().position(matches) {
+            return Ok(self.inbox.remove(i).expect("index from position"));
+        }
+        loop {
+            let v = self.read_json().await?;
+            if matches(&v) {
+                return Ok(v);
+            }
+            self.inbox.push_back(v);
+        }
+    }
+
+    /// Next text frame as JSON (buffered ones first).
+    async fn recv(&mut self) -> Result<Value, WsError> {
+        match self.inbox.pop_front() {
+            Some(v) => Ok(v),
+            None => self.read_json().await,
+        }
+    }
+
+    async fn read_json(&mut self) -> Result<Value, WsError> {
+        loop {
+            let msg = tokio::time::timeout(REPLY_TIMEOUT, self.stream.next())
+                .await
+                .map_err(|_| WsError::Timeout)?;
+            match msg {
+                Some(Ok(Message::Text(text))) => {
+                    return serde_json::from_str(&text).map_err(|e| WsError::Transport(format!("non-json frame {text}: {e}")));
+                }
+                Some(Ok(Message::Close(frame))) => return Err(closed(frame)),
+                // pings are answered by tungstenite itself while reading
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(WsError::Transport(e.to_string())),
+                None => {
+                    return Err(WsError::Closed {
+                        code: None,
+                        reason: "stream ended".into(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn closed(frame: Option<CloseFrame>) -> WsError {
+    WsError::Closed {
+        code: frame.as_ref().map(|f| u16::from(f.code)),
+        reason: frame.map(|f| f.reason.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Accepts the gate's self-signed cert, like `http_client()`'s `danger_accept_invalid_certs`.
+fn tls_connector() -> Connector {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("rustls protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth();
+    Connector::Rustls(Arc::new(config))
+}
+
+#[derive(Debug)]
+struct AcceptAnyCert(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
