@@ -31,6 +31,10 @@ futures-util = { workspace = true }
 # explicit crypto backend for the ws client's TLS config
 rustls = { workspace = true, features = ["ring"] }
 serde_json = { workspace = true }
-anyhow = { workspace = true }
+# run: static https server for frontend/
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower-http = { workspace = true }
+anyhow = { version = "1.0.98" }
 skw-lib-shared = { workspace = true }
 skw-lib-http-protos = { workspace = true }

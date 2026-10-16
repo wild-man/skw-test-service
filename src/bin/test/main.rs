@@ -37,7 +37,16 @@ fn main() -> ExitCode {
         }
     }
 
-    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    // `cargo run` exports per-package vars; build scripts (ring) watch them → endless rebuilds
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if k.starts_with("CARGO_PKG_") || k.starts_with("CARGO_MANIFEST_") || matches!(&*k, "CARGO_CRATE_NAME" | "CARGO_BIN_NAME" | "CARGO_PRIMARY_PACKAGE" | "OUT_DIR") {
+            cmd.env_remove(&key);
+        }
+    }
+
+    let status = cmd
         .current_dir(crate_dir())
         .args(["test", "--bin", "test", "--"])
         .args(std::env::args().skip(1))

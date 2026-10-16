@@ -5,6 +5,10 @@
 //! services may depend on them (e.g. stream consumers need topics created by the gates).
 //! Developer's responsibility beforehand: infra (iggy, postgres, redis, rabbitmq) running,
 //! binaries built (`cargo build`), migrations applied.
+//!
+//! Also serves the workspace `frontend/` folder over https on `FRONTEND_BIND_ADDRESS`
+//! (default `127.0.0.1:8000`) with the gates' self-signed cert (`conf/skw-api-gate.*.pem`), so
+//! pages can talk to the gates from a browser (api-gate allows this origin via `/service/cors`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +16,14 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::{
+    Router,
+    http::{HeaderValue, header},
+};
+use axum_server::{
+    Server,
+    tls_rustls::{RustlsAcceptor, RustlsConfig},
+};
 use serde_json::Value;
 use skw_lib_shared::prelude::consts::CONFIG_FILE_ENV;
 use skw_test_service::{ServiceEntry, crate_dir, listen_port, load_services};
@@ -19,7 +31,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
+use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
+const FRONTEND_BIND_ADDRESS_ENV: &str = "FRONTEND_BIND_ADDRESS";
+const FRONTEND_DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
+/// workspace-relative; same cert as the gates (SAN: localhost, 127.0.0.1)
+const FRONTEND_TLS_CERT: &str = "conf/skw-api-gate.cert.pem";
+const FRONTEND_TLS_KEY: &str = "conf/skw-api-gate.key.pem";
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -62,6 +80,10 @@ async fn main() -> Result<()> {
         }
         daemons.push((s, crate_dir.as_path()));
     }
+
+    // bound before any service is spawned, so a busy port fails fast
+    let frontend = frontend_server().await?;
+    tokio::spawn(serve_frontend(frontend));
 
     let mut running: Vec<Running> = vec![];
     let started = tokio::select! {
@@ -114,6 +136,55 @@ async fn start_all(ws: &Workspace, daemons: &[(&ServiceEntry, &Path)], running: 
         }
     }
     Ok(())
+}
+
+fn workspace_dir() -> PathBuf {
+    crate_dir().join("../..")
+}
+
+fn frontend_dir() -> PathBuf {
+    workspace_dir().join("frontend")
+}
+
+async fn frontend_server() -> Result<Server<std::net::SocketAddr, RustlsAcceptor>> {
+    let addr = std::env::var(FRONTEND_BIND_ADDRESS_ENV).unwrap_or_else(|_| FRONTEND_DEFAULT_BIND_ADDRESS.into());
+    let dir = frontend_dir();
+    if !dir.is_dir() {
+        bail!("frontend dir {} not found", dir.display());
+    }
+
+    // the build may enable both rustls backends (gates use aws-lc-rs), so pick one explicitly
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls = RustlsConfig::from_pem_file(
+        workspace_dir().join(FRONTEND_TLS_CERT),
+        workspace_dir().join(FRONTEND_TLS_KEY),
+    )
+    .await
+    .with_context(|| format!("frontend: load {FRONTEND_TLS_CERT} / {FRONTEND_TLS_KEY}"))?;
+
+    let listener = std::net::TcpListener::bind(&addr).with_context(|| format!("frontend: bind {addr}"))?;
+    listener.set_nonblocking(true)?;
+    let server = axum_server::from_tcp_rustls(listener, tls)?;
+
+    println!(
+        "[frontend] serving {} on https://{addr}/",
+        dir.canonicalize().unwrap_or(dir).display()
+    );
+    Ok(server)
+}
+
+/// Static files of `frontend/` (`index.html` for directories), never cached so edits show up on reload.
+async fn serve_frontend(server: Server<std::net::SocketAddr, RustlsAcceptor>) {
+    let app = Router::new()
+        .fallback_service(ServeDir::new(frontend_dir()))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ));
+
+    if let Err(e) = server.serve(app.into_make_service()).await {
+        eprintln!("[frontend] server stopped: {e}");
+    }
 }
 
 /// Reports crashed services; returns when none is left running.
