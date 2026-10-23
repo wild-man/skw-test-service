@@ -7,8 +7,10 @@
 //! - signed topics: the connection must first send `Authorize { ApiKey }` (no `Uri`) → `{"Authorized": true}`,
 //!   then every frame carries the b64 ed25519 signature of `Data`; otherwise the gate closes the
 //!   connection with policy code 1008 "Unauthorized"
-//! - replies: `{"Signature", "ErrorMsg", "ErrCode", "Payload"}`, correlated by the frame's `Signature`;
-//!   `ErrCode` is the HTTP status the api gate answers in the same case
+//! - replies: `{"Signature", "Status", "ErrorMsg", "ErrCode", "Payload"}`, correlated by the frame's
+//!   `Signature`; `Status`/`ErrCode` is the HTTP status the api gate answers in the same case
+//! - a provisional reply (`Status` 201/202) means the request was taken; its final reply (200)
+//!   comes later with the same `Signature` — [`WsGate::wait_final_reply`] waits for it
 //! - the gate drops a client silent for `clientTimeoutSecs` (10s); pings are answered
 //!   automatically only while the client is reading (i.e. inside a request)
 
@@ -26,6 +28,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use skw_lib_shared::prelude::uuid::Uuid;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
@@ -134,18 +137,51 @@ impl WsGate {
 
         match self.conn.reply(id).await {
             Ok(v) => into_reply(v),
-            Err(e) => {
-                let rejected = rejection(e);
-                self.rejected = Some(rejected.clone());
-                rejected
-            }
+            Err(e) => self.reject(e),
         }
+    }
+
+    /// Waits up to `timeout` for the final reply to request `id`: provisional replies (201/202)
+    /// are logged and skipped. Panics if no final reply arrives in time.
+    pub async fn wait_final_reply(&mut self, id: &str, timeout: Duration) -> GateReply {
+        if let Some(rejected) = &self.rejected {
+            return rejected.clone();
+        }
+
+        let started = Instant::now();
+        let deadline = started + timeout;
+        loop {
+            let reply = match self.conn.reply_until(id, deadline).await {
+                Ok(v) => into_reply(v),
+                Err(WsError::Timeout) => panic!("request {id}: no final reply within {timeout:?}"),
+                Err(e) => return self.reject(e),
+            };
+            if !matches!(reply.status, StatusCode::CREATED | StatusCode::ACCEPTED) {
+                return reply;
+            }
+            eprintln!(
+                "[test] request {id}: provisional {} after {:?} {}; waiting for the final reply (up to {timeout:?})",
+                reply.status,
+                started.elapsed(),
+                reply.payload
+            );
+        }
+    }
+
+    /// Remembers a connection-level error: every later call returns it.
+    fn reject(&mut self, e: WsError) -> GateReply {
+        let rejected = rejection(e);
+        self.rejected = Some(rejected.clone());
+        rejected
     }
 }
 
+/// `Status` is the reply's HTTP-like status (201/202 for a provisional reply); `ErrCode` is kept
+/// as the fallback for frames without it (e.g. the gate's own error/timeout frames).
 fn into_reply(v: Value) -> GateReply {
     let status = v
-        .get("ErrCode")
+        .get("Status")
+        .or_else(|| v.get("ErrCode"))
         .and_then(Value::as_u64)
         .map(|c| {
             u16::try_from(c)
@@ -222,13 +258,19 @@ impl WsConn {
 
     /// Waits for the reply carrying `signature`; other frames are kept for later `recv` calls.
     async fn reply(&mut self, signature: &str) -> Result<Value, WsError> {
+        self.reply_until(signature, Instant::now() + REPLY_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::reply`] with an explicit deadline for the whole wait.
+    async fn reply_until(&mut self, signature: &str, deadline: Instant) -> Result<Value, WsError> {
         let matches = |v: &Value| v.get("Signature").and_then(Value::as_str) == Some(signature);
 
         if let Some(i) = self.inbox.iter().position(matches) {
             return Ok(self.inbox.remove(i).expect("index from position"));
         }
         loop {
-            let v = self.read_json().await?;
+            let v = self.read_json(deadline).await?;
             if matches(&v) {
                 return Ok(v);
             }
@@ -240,13 +282,13 @@ impl WsConn {
     async fn recv(&mut self) -> Result<Value, WsError> {
         match self.inbox.pop_front() {
             Some(v) => Ok(v),
-            None => self.read_json().await,
+            None => self.read_json(Instant::now() + REPLY_TIMEOUT).await,
         }
     }
 
-    async fn read_json(&mut self) -> Result<Value, WsError> {
+    async fn read_json(&mut self, deadline: Instant) -> Result<Value, WsError> {
         loop {
-            let msg = tokio::time::timeout(REPLY_TIMEOUT, self.stream.next())
+            let msg = tokio::time::timeout_at(deadline, self.stream.next())
                 .await
                 .map_err(|_| WsError::Timeout)?;
             match msg {

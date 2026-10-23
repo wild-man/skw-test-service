@@ -2,6 +2,7 @@
 //! client-chosen request ids; many requests can be in flight on one connection.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde_json::json;
@@ -11,6 +12,8 @@ use crate::gate::{Auth, Gate, WsGate};
 use crate::keys::main_key;
 
 const PIPELINED_REQUESTS: usize = 100;
+/// the gate's own 30s request watchdog plus a margin: its 504 must arrive before we give up
+const FINAL_REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Clone, Copy, Debug)]
 enum PingRequest {
@@ -114,4 +117,25 @@ async fn signed_ping_via_public_topic_is_bad_request() {
         .request("/ping/public", &signed::RpcMethod::PingSigned {})
         .await
         .assert_status(StatusCode::BAD_REQUEST);
+}
+
+// --- provisional replies: a 201/202 frame is not the end of a ws request, the test waits
+// (logging every provisional reply) for the final 200 and fails on timeout ---
+
+async fn signed_ping_replies_ok_after_provisional(method: signed::RpcMethod) {
+    let mut ws = WsGate::client(Auth::Key(main_key().await)).await;
+    let id = ws.send_request("/ping/signed", &method).await;
+    ws.wait_final_reply(&id, FINAL_REPLY_TIMEOUT)
+        .await
+        .assert_status(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ping_created_replies_ok_after_created() {
+    signed_ping_replies_ok_after_provisional(signed::RpcMethod::PingCreated {}).await;
+}
+
+#[tokio::test]
+async fn ping_accepted_replies_ok_after_accepted() {
+    signed_ping_replies_ok_after_provisional(signed::RpcMethod::PingAccepted {}).await;
 }

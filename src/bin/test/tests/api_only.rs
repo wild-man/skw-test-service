@@ -1,7 +1,7 @@
 //! `api-gate`-only behavior: HTTP method rules and per-request auth headers on non-signed topics.
 
 use reqwest::StatusCode;
-use skw_lib_http_protos::ping::signed;
+use skw_lib_http_protos::ping::{RpcPayload, signed};
 
 use crate::common::gate_body;
 use crate::gate::{ApiGate, Auth, Gate};
@@ -29,4 +29,35 @@ async fn post_to_public_topic_is_bad_request() {
     gate.post("/ping/public", body, &headers)
         .await
         .assert_status(StatusCode::BAD_REQUEST);
+}
+
+// --- provisional replies: an HTTP request gets one reply, either the provisional 201/202
+// (request taken, result read later) or the final 200; both are valid ---
+
+/// a 2xx reply to `method`: `provisional` with `expected` payload, or a final 200 with any payload
+async fn signed_ping_replies_provisional_or_ok(method: signed::RpcMethod, provisional: StatusCode, expected: fn(&RpcPayload) -> bool) {
+    let reply = ApiGate::client(Auth::Key(main_key().await))
+        .await
+        .signed("ping", &method)
+        .await;
+    match reply.status {
+        StatusCode::OK => {
+            reply.payload::<RpcPayload>();
+        }
+        s if s == provisional => {
+            let payload = reply.payload::<RpcPayload>();
+            assert!(expected(&payload), "unexpected {provisional} payload: {payload:?}");
+        }
+        _ => panic!("expected 200 or {provisional}, got {reply:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ping_created_replies_created_or_ok() {
+    signed_ping_replies_provisional_or_ok(signed::RpcMethod::PingCreated {}, StatusCode::CREATED, |p| matches!(p, RpcPayload::PingCreated {})).await;
+}
+
+#[tokio::test]
+async fn ping_accepted_replies_accepted_or_ok() {
+    signed_ping_replies_provisional_or_ok(signed::RpcMethod::PingAccepted {}, StatusCode::ACCEPTED, |p| matches!(p, RpcPayload::PingAccepted {})).await;
 }
