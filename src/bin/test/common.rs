@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde::Serialize;
-use skw_lib_shared::prelude::chrono::Utc;
+use skw_lib_shared::prelude::chrono::{DateTime, Utc};
 use skw_lib_shared::prelude::jsonrpc::JsonRpcGateHttpRequest;
 use skw_test_service::{find_service, listen_port};
 
@@ -39,8 +39,13 @@ pub fn http_client() -> reqwest::Client {
 
 /// Gate request body: `{"Ts": <now>, "Method": ..., "Params": {...}}`.
 pub fn gate_body<M: Serialize>(method: &M) -> String {
+    gate_body_at(method, Utc::now())
+}
+
+/// [`gate_body`] with a chosen `Ts`, e.g. an outdated one.
+pub fn gate_body_at<M: Serialize>(method: &M, ts: DateTime<Utc>) -> String {
     let req = JsonRpcGateHttpRequest {
-        ts: Utc::now(),
+        ts,
         method: serde_json::to_value(method).expect("serialize rpc method"),
     };
     serde_json::to_string(&req).expect("serialize gate request")

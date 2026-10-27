@@ -7,6 +7,8 @@
 //! - signed topics: the connection must first send `Authorize { ApiKey }` (no `Uri`) → `{"Authorized": true}`,
 //!   then every frame carries the b64 ed25519 signature of `Data`; otherwise the gate closes the
 //!   connection with policy code 1008 "Unauthorized"
+//! - a signed frame whose `Ts` is outdated (more than `BACK_MESSAGE_TIMEOUT` from the gate clock), or
+//!   whose signature is still pending, gets an `ErrCode` 409 reply; an outdated `Authorize` is refused (1008)
 //! - replies: `{"Signature", "Status", "ErrorMsg", "ErrCode", "Payload"}`, correlated by the frame's
 //!   `Signature`; `Status`/`ErrCode` is the HTTP status the api gate answers in the same case
 //! - a provisional reply (`Status` 201/202) means the request was taken; its final reply (200)
@@ -115,6 +117,31 @@ impl WsGate {
         };
         self.send_frame(uri, &data, &signature).await;
         signature
+    }
+
+    /// Sends the identical signed frame (same `Data`, same `Signature`) twice without waiting;
+    /// returns the signature both replies carry.
+    pub async fn send_request_twice<M: Serialize>(&mut self, uri: &str, method: &M) -> String {
+        let data = gate_body(method);
+        let (_, signer) = self
+            .auth
+            .identity()
+            .expect("duplicate requests need a signing key");
+        let signature = signer.sign(&data);
+        self.send_frame(uri, &data, &signature).await;
+        self.send_frame(uri, &data, &signature).await;
+        signature
+    }
+
+    /// Signs and sends a ready-made `Data` body (e.g. one with an outdated `Ts`), waits for its reply.
+    pub async fn request_signed_body(&mut self, uri: &str, data: &str) -> GateReply {
+        let (_, signer) = self
+            .auth
+            .identity()
+            .expect("signed bodies need a signing key");
+        let signature = signer.sign(data);
+        self.send_frame(uri, data, &signature).await;
+        self.wait_reply(&signature).await
     }
 
     async fn send_frame(&mut self, uri: &str, data: &str, signature: &str) {

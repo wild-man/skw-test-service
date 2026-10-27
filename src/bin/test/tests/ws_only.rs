@@ -7,6 +7,9 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::json;
 use skw_lib_http_protos::ping::{RpcPayload, open, signed};
+use skw_lib_shared::prelude::chrono::{TimeDelta, Utc};
+
+use crate::common::gate_body_at;
 
 use crate::gate::{Auth, Gate, WsGate};
 use crate::keys::main_key;
@@ -138,4 +141,44 @@ async fn ping_created_replies_ok_after_created() {
 #[tokio::test]
 async fn ping_accepted_replies_ok_after_accepted() {
     signed_ping_replies_ok_after_provisional(signed::RpcMethod::PingAccepted {}).await;
+}
+
+/// a signed request is keyed by its signature: the identical frame sent again while the first is
+/// still pending is refused (409) instead of overwriting it and running twice
+/// (`PingSlow` keeps the first one pending: a plain `PingSigned` is often answered before the
+/// gate reads the second frame)
+#[tokio::test]
+async fn duplicate_signed_request_while_pending_is_conflict() {
+    let mut ws = WsGate::client(Auth::Key(main_key().await)).await;
+    let id = ws
+        .send_request_twice("/ping/signed", &signed::RpcMethod::PingSlow {})
+        .await;
+
+    // both replies carry the same signature, in no fixed order
+    let mut replies = vec![ws.wait_reply(&id).await, ws.wait_reply(&id).await];
+    replies.sort_by_key(|r| r.status);
+
+    replies[1].assert_status(StatusCode::CONFLICT);
+    assert!(matches!(
+        replies.swap_remove(0).payload(),
+        RpcPayload::Ping { .. }
+    ));
+}
+
+/// a validly signed frame whose `Ts` is long past (a captured frame replayed later) is refused,
+/// and the connection stays usable
+#[tokio::test]
+async fn outdated_signed_request_is_conflict() {
+    let mut ws = WsGate::client(Auth::Key(main_key().await)).await;
+    let data = gate_body_at(
+        &signed::RpcMethod::PingSigned {},
+        Utc::now() - TimeDelta::minutes(5),
+    );
+
+    ws.request_signed_body("/ping/signed", &data)
+        .await
+        .assert_status(StatusCode::CONFLICT);
+
+    let reply = ws.signed("ping", &signed::RpcMethod::PingSigned {}).await;
+    assert!(matches!(reply.payload(), RpcPayload::Ping { .. }));
 }
