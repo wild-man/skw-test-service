@@ -15,6 +15,8 @@
 //!   comes later with the same `Signature` — [`WsGate::wait_final_reply`] waits for it
 //! - the gate drops a client silent for `clientTimeoutSecs` (10s); pings are answered
 //!   automatically only while the client is reading (i.e. inside a request)
+//! - after sending its own Close (1008) the gate keeps reading frames; [`RawWs`] (reads the socket
+//!   itself, never answers pings or echoes Close) checks whether the gate still closes the socket
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::Serialize;
 use serde_json::{Value, json};
 use skw_lib_shared::prelude::uuid::Uuid;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
@@ -40,7 +43,7 @@ use crate::common::{gate_body, ws_gate_url};
 
 const WS_PATH: &str = "/ws/";
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-const CLOSE_POLICY: u16 = 1008;
+pub const CLOSE_POLICY: u16 = 1008;
 
 pub struct WsGate {
     conn: WsConn,
@@ -195,6 +198,23 @@ impl WsGate {
         }
     }
 
+    /// Next reply of any request, in arrival order (buffered ones first), with the `Signature`
+    /// it carries. Unlike [`Self::wait_reply`] it doesn't pick, so a reply meant for another
+    /// connection shows up here.
+    pub async fn next_reply(&mut self) -> (String, GateReply) {
+        let v = self
+            .conn
+            .recv()
+            .await
+            .unwrap_or_else(|e| panic!("no reply: {e:?}"));
+        let signature = v
+            .get("Signature")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("reply without Signature: {v}"))
+            .to_string();
+        (signature, into_reply(v))
+    }
+
     /// Remembers a connection-level error: every later call returns it.
     fn reject(&mut self, e: WsError) -> GateReply {
         let rejected = rejection(e);
@@ -341,6 +361,110 @@ fn closed(frame: Option<CloseFrame>) -> WsError {
     WsError::Closed {
         code: frame.as_ref().map(|f| u16::from(f.code)),
         reason: frame.map(|f| f.reason.to_string()).unwrap_or_default(),
+    }
+}
+
+const OPCODE_TEXT: u8 = 0x1;
+const OPCODE_CLOSE: u8 = 0x8;
+
+/// A server frame as sent on the wire.
+#[derive(Debug)]
+pub struct RawFrame {
+    pub opcode: u8,
+    pub payload: Vec<u8>,
+}
+
+impl RawFrame {
+    pub fn is_text(&self) -> bool {
+        self.opcode == OPCODE_TEXT
+    }
+
+    pub fn is_close(&self) -> bool {
+        self.opcode == OPCODE_CLOSE
+    }
+
+    /// Status code of a Close frame (first two payload bytes, big-endian).
+    pub fn close_code(&self) -> Option<u16> {
+        match self.payload[..] {
+            [hi, lo, ..] if self.is_close() => Some(u16::from_be_bytes([hi, lo])),
+            _ => None,
+        }
+    }
+}
+
+/// Why [`RawWs::next_frame`] returned no frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawEnd {
+    /// the gate closed the socket (EOF or a reset)
+    Closed,
+    Timeout,
+}
+
+/// A ws client that reads the socket itself: tungstenite only does the handshake and writes
+/// frames, so nothing answers the gate's pings or echoes its Close. Tests use it to watch what
+/// the gate does on its own (heartbeat timeout, closing after its Close).
+pub struct RawWs {
+    stream: WsStream,
+    buf: Vec<u8>,
+}
+
+impl RawWs {
+    pub async fn connect() -> Self {
+        RawWs {
+            stream: WsConn::connect().await.stream,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Fails once the gate has closed the socket.
+    pub async fn send_text(&mut self, text: String) -> Result<(), String> {
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Next server frame, read straight from the socket.
+    pub async fn next_frame(&mut self, deadline: Instant) -> Result<RawFrame, RawEnd> {
+        loop {
+            if let Some(frame) = self.parse_frame() {
+                return Ok(frame);
+            }
+            let mut chunk = [0u8; 4096];
+            let read = tokio::time::timeout_at(deadline, self.stream.get_mut().read(&mut chunk))
+                .await
+                .map_err(|_| RawEnd::Timeout)?;
+            match read {
+                Ok(0) | Err(_) => return Err(RawEnd::Closed),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// Takes one complete frame off `buf`. Server frames are unmasked.
+    fn parse_frame(&mut self) -> Option<RawFrame> {
+        let [b0, b1, rest @ ..] = &self.buf[..] else {
+            return None;
+        };
+        assert_eq!(b1 & 0x80, 0, "server frames must not be masked");
+        let (len, header) = match b1 & 0x7F {
+            126 => (
+                u64::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?)),
+                4,
+            ),
+            127 => (u64::from_be_bytes(rest.get(..8)?.try_into().ok()?), 10),
+            n => (u64::from(n), 2),
+        };
+        let end = header + usize::try_from(len).expect("frame length fits usize");
+        if self.buf.len() < end {
+            return None;
+        }
+        let frame = RawFrame {
+            opcode: b0 & 0x0F,
+            payload: self.buf[header..end].to_vec(),
+        };
+        self.buf.drain(..end);
+        Some(frame)
     }
 }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use skw_lib_shared::prelude::chrono::{DateTime, Utc};
 use skw_lib_shared::prelude::jsonrpc::JsonRpcGateHttpRequest;
-use skw_test_service::{find_service, listen_port};
+use skw_test_service::{find_service, listen_port, read_json};
 
 static API_GATE_PORT: LazyLock<u16> = LazyLock::new(|| gate_port("api-gate"));
 static WS_GATE_PORT: LazyLock<u16> = LazyLock::new(|| gate_port("ws"));
@@ -24,6 +24,29 @@ pub fn api_gate_url(path: &str) -> String {
 
 pub fn ws_gate_url(path: &str) -> String {
     format!("wss://localhost:{}{path}", *WS_GATE_PORT)
+}
+
+/// A number from the ws gate's config (the one `run` starts it with).
+fn ws_gate_config_u64(pointer: &str) -> u64 {
+    find_service("ws")
+        .and_then(|s| read_json(&s.config))
+        .expect("invalid ws entry in cfg/services.json")
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("ws gate config has no {pointer}"))
+}
+
+/// The ws gate's heartbeat timers from its config: (`heartbeatIntervalSecs`, `clientTimeoutSecs`).
+pub fn ws_gate_heartbeat() -> (Duration, Duration) {
+    (
+        Duration::from_secs(ws_gate_config_u64("/service/heartbeatIntervalSecs")),
+        Duration::from_secs(ws_gate_config_u64("/service/clientTimeoutSecs")),
+    )
+}
+
+/// The ws gate's `maxPendingRequests`: requests one connection may have waiting for a reply.
+pub fn ws_gate_max_pending_requests() -> usize {
+    usize::try_from(ws_gate_config_u64("/service/maxPendingRequests")).expect("maxPendingRequests fits usize")
 }
 
 /// New client per test: a `reqwest::Client` is bound to the runtime it first ran on,

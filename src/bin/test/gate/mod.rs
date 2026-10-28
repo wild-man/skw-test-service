@@ -6,7 +6,7 @@ pub mod api;
 pub mod ws;
 
 pub use api::ApiGate;
-pub use ws::WsGate;
+pub use ws::{RawEnd, RawWs, WsGate};
 
 use reqwest::StatusCode;
 use serde::Serialize;

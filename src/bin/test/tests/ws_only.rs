@@ -1,18 +1,24 @@
 //! `ws`-gate-only behavior: any method can be sent to any topic uri; unsigned requests carry
 //! client-chosen request ids; many requests can be in flight on one connection.
 
+use std::assert_matches;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde_json::json;
 use skw_lib_http_protos::ping::{RpcPayload, open, signed};
 use skw_lib_shared::prelude::chrono::{TimeDelta, Utc};
+use skw_lib_shared::prelude::uuid::Uuid;
+use tokio::sync::Barrier;
+use tokio::time::Instant;
 
-use crate::common::gate_body_at;
+use crate::common::{gate_body, gate_body_at, ws_gate_heartbeat, ws_gate_max_pending_requests};
 
-use crate::gate::{Auth, Gate, WsGate};
-use crate::keys::main_key;
+use crate::gate::ws::{CLOSE_POLICY, ws_frame};
+use crate::gate::{Auth, Gate, RawEnd, RawWs, WsGate};
+use crate::keys::{ApiKey, main_key, other_key};
 
 const PIPELINED_REQUESTS: usize = 100;
 /// the gate's own 30s request watchdog plus a margin: its 504 must arrive before we give up
@@ -81,6 +87,104 @@ async fn pipelined_requests_on_authorized_connection_all_get_their_replies() {
         &plan,
     )
     .await;
+}
+
+const CONCURRENT_SIGNED_REQUESTS: usize = 1000;
+
+/// One client of [`concurrent_signed_clients_get_only_their_own_replies`]: waits for `start`,
+/// then sends its signed pings as fast as replies allow, keeping up to 5/6 of the gate's
+/// `maxPendingRequests` waiting (more would get the connection closed), and reads every reply
+/// in arrival order. Returns the signatures sent and received.
+async fn signed_client(key: &'static ApiKey, start: Arc<Barrier>) -> (HashSet<String>, Vec<String>) {
+    let max_waiting = ws_gate_max_pending_requests() * 5 / 6;
+    let mut ws = WsGate::client(Auth::Key(key)).await;
+    start.wait().await;
+
+    let mut sent = HashSet::with_capacity(CONCURRENT_SIGNED_REQUESTS);
+    let mut received = Vec::with_capacity(CONCURRENT_SIGNED_REQUESTS);
+    while received.len() < CONCURRENT_SIGNED_REQUESTS {
+        while sent.len() < CONCURRENT_SIGNED_REQUESTS && sent.len() - received.len() < max_waiting {
+            let signature = ws
+                .send_request("/ping/signed", &signed::RpcMethod::PingSigned {})
+                .await;
+            assert!(
+                sent.insert(signature),
+                "duplicate signature: request ids must be unique"
+            );
+        }
+
+        let (signature, reply) = ws.next_reply().await;
+        assert!(
+            matches!(reply.payload(), RpcPayload::Ping { .. }),
+            "request {signature}: not a Ping reply"
+        );
+        received.push(signature);
+    }
+    (sent, received)
+}
+
+/// A connection with `maxPendingRequests` requests waiting for their reply is closed (1008) by
+/// the next frame. `PingSlow` keeps each request waiting for 1s, longer than sending them all.
+#[tokio::test]
+async fn too_many_pending_requests_close_the_connection() {
+    let max_pending = ws_gate_max_pending_requests();
+    let mut ws = WsGate::client(Auth::Key(main_key().await)).await;
+
+    let mut last = String::new();
+    for _ in 0..=max_pending {
+        last = ws
+            .send_request("/ping/signed", &signed::RpcMethod::PingSlow {})
+            .await;
+    }
+
+    // the Close arrives before any PingSlow reply; it ends every request of the connection
+    let reply = ws.wait_reply(&last).await;
+    reply.assert_status(StatusCode::FORBIDDEN);
+    assert_eq!(
+        reply.error_msg.as_deref(),
+        Some("Too many pending requests")
+    );
+}
+
+/// Two connections (different keys) in separate tasks of a multi-threaded runtime send signed
+/// requests at the same time: each must get a reply to every signature it sent, and none it
+/// didn't send (both gates share one back topic, replies are routed by signature).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_signed_clients_get_only_their_own_replies() {
+    let start = Arc::new(Barrier::new(2));
+    let a = tokio::spawn(signed_client(main_key().await, start.clone()));
+    let b = tokio::spawn(signed_client(other_key().await, start));
+    let (a, b) = (a.await.expect("client a"), b.await.expect("client b"));
+
+    for (name, (sent, received)) in [("a", &a), ("b", &b)] {
+        let received_set: HashSet<&String> = received.iter().collect();
+        assert_eq!(
+            received_set.len(),
+            received.len(),
+            "client {name}: a signature was answered twice"
+        );
+
+        let foreign: Vec<_> = received_set
+            .iter()
+            .filter(|s| !sent.contains(s.as_str()))
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "client {name} got replies it never sent: {foreign:?}"
+        );
+
+        let missing: Vec<_> = sent.iter().filter(|s| !received_set.contains(s)).collect();
+        assert!(
+            missing.is_empty(),
+            "client {name} got no reply for: {missing:?}"
+        );
+    }
+
+    // different keys sign different bodies: the two clients' signatures never collide
+    assert!(
+        a.0.is_disjoint(&b.0),
+        "both clients sent the same signature"
+    );
 }
 
 /// unsigned requests are correlated by gate-minted ids, the client's ids are only echoed back
@@ -181,4 +285,84 @@ async fn outdated_signed_request_is_conflict() {
 
     let reply = ws.signed("ping", &signed::RpcMethod::PingSigned {}).await;
     assert!(matches!(reply.payload(), RpcPayload::Ping { .. }));
+}
+
+// --- connection lifetime: `RawWs` never answers pings nor echoes Close, so only the gate can
+// close the socket ---
+
+/// a client that answers no pings is dropped once `clientTimeoutSecs` passed without a pong
+/// (checked on each heartbeat tick, hence the extra interval)
+#[tokio::test]
+async fn silent_client_is_dropped_after_client_timeout() {
+    let (interval, client_timeout) = ws_gate_heartbeat();
+    let mut raw = RawWs::connect().await;
+    let started = Instant::now();
+    let deadline = started + client_timeout + interval + Duration::from_secs(2);
+
+    let end = loop {
+        match raw.next_frame(deadline).await {
+            Ok(_ping) => continue,
+            Err(end) => break end,
+        }
+    };
+
+    assert_eq!(
+        end,
+        RawEnd::Closed,
+        "gate kept a silent client past {deadline:?}"
+    );
+    assert!(
+        started.elapsed() >= client_timeout,
+        "gate dropped a silent client after {:?}, before clientTimeoutSecs ({client_timeout:?})",
+        started.elapsed()
+    );
+}
+
+/// after refusing a frame with Close 1008 the gate must close the socket itself, even if the
+/// client neither echoes the Close nor goes silent (it keeps sending frames, refreshing the
+/// gate's heartbeat)
+#[tokio::test]
+async fn rejected_client_ignoring_close_is_disconnected() {
+    const CLOSE_GRACE: Duration = Duration::from_secs(3);
+    let public = json!({ "Method": "Public", "Params": {} });
+
+    let mut raw = RawWs::connect().await;
+    raw.send_text("not a request".into())
+        .await
+        .expect("ws send failed");
+    let close = raw
+        .next_frame(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect("gate did not answer the invalid frame");
+    assert_eq!(
+        close.close_code(),
+        Some(CLOSE_POLICY),
+        "expected Close 1008, got {close:?}"
+    );
+
+    let deadline = Instant::now() + CLOSE_GRACE;
+    let mut keep_alive = tokio::time::interval(Duration::from_secs(1));
+    let mut answered_after_close = 0;
+    let end = loop {
+        tokio::select! {
+            _ = keep_alive.tick() => {
+                let frame = ws_frame(Some("/ping/public"), &gate_body(&public), &Uuid::now_v7().to_string());
+                if raw.send_text(frame).await.is_err() {
+                    break RawEnd::Closed;
+                }
+            }
+            frame = raw.next_frame(deadline) => match frame {
+                Ok(f) if f.is_text() => answered_after_close += 1,
+                Ok(_) => {}
+                Err(end) => break end,
+            },
+        }
+    };
+
+    assert_matches!(
+        end,
+        RawEnd::Closed | RawEnd::Timeout,
+        "gate kept the connection open {CLOSE_GRACE:?} after its own Close 1008 \
+         (and answered {answered_after_close} requests sent after it)"
+    );
 }
