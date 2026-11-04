@@ -49,6 +49,11 @@ pub fn ws_gate_max_pending_requests() -> usize {
     usize::try_from(ws_gate_config_u64("/service/maxPendingRequests")).expect("maxPendingRequests fits usize")
 }
 
+/// The ws gate's `maxSessionsPerToken`: authorized connections one API key may hold at once.
+pub fn ws_gate_max_sessions_per_token() -> usize {
+    usize::try_from(ws_gate_config_u64("/service/maxSessionsPerToken")).expect("maxSessionsPerToken fits usize")
+}
+
 /// New client per test: a `reqwest::Client` is bound to the runtime it first ran on,
 /// and every `#[tokio::test]` has its own runtime.
 pub fn http_client() -> reqwest::Client {

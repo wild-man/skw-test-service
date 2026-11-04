@@ -71,6 +71,8 @@ impl Gate for WsGate {
 
             match gate.conn.recv().await {
                 Ok(v) if v.get("Authorized") == Some(&Value::Bool(true)) => {}
+                // a refused Authorize (e.g. too many sessions of the key): error reply, then Close 1008
+                Ok(v) if v.get("ErrCode").is_some() => gate.rejected = Some(into_reply(v)),
                 Ok(v) => panic!("unexpected authorize reply: {v}"),
                 Err(e) => gate.rejected = Some(rejection(e)),
             }
@@ -97,6 +99,11 @@ impl Gate for WsGate {
 }
 
 impl WsGate {
+    /// The reply the gate refused this connection with (on `Authorize` or later), if it did.
+    pub fn rejection(&self) -> Option<&GateReply> {
+        self.rejected.as_ref()
+    }
+
     /// Sends `method` to any `uri` and waits for its reply.
     pub async fn request<M: Serialize>(&mut self, uri: &str, method: &M) -> GateReply {
         let id = self.send_request(uri, method).await;

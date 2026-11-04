@@ -23,6 +23,12 @@ pub async fn other_key() -> &'static ApiKey {
     OTHER_KEY.get_or_init(ApiKey::create).await
 }
 
+/// A key of its own, for tests that count something per key (e.g. ws sessions), so tests
+/// running in parallel with [`main_key`] can't disturb them. Leaked: `Auth` holds `&'static`.
+pub async fn fresh_key() -> &'static ApiKey {
+    Box::leak(Box::new(ApiKey::create().await))
+}
+
 pub struct ApiKey {
     pub id: Uuid,
     signing_key: SigningKey,

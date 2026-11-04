@@ -14,11 +14,11 @@ use skw_lib_shared::prelude::uuid::Uuid;
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-use crate::common::{gate_body, gate_body_at, ws_gate_heartbeat, ws_gate_max_pending_requests};
+use crate::common::{gate_body, gate_body_at, ws_gate_heartbeat, ws_gate_max_pending_requests, ws_gate_max_sessions_per_token};
 
 use crate::gate::ws::{CLOSE_POLICY, ws_frame};
 use crate::gate::{Auth, Gate, RawEnd, RawWs, WsGate};
-use crate::keys::{ApiKey, main_key, other_key};
+use crate::keys::{ApiKey, fresh_key, main_key, other_key};
 
 const PIPELINED_REQUESTS: usize = 100;
 /// the gate's own 30s request watchdog plus a margin: its 504 must arrive before we give up
@@ -144,6 +144,54 @@ async fn too_many_pending_requests_close_the_connection() {
         reply.error_msg.as_deref(),
         Some("Too many pending requests")
     );
+}
+
+/// An API key holding `maxSessionsPerToken` authorized connections can't authorize one more
+/// (403 "Too many sessions", then Close 1008); closing one of them frees its session.
+#[tokio::test]
+async fn too_many_sessions_per_key_are_forbidden() {
+    let max_sessions = ws_gate_max_sessions_per_token();
+    let key = fresh_key().await;
+
+    let mut sessions = Vec::with_capacity(max_sessions);
+    for n in 0..max_sessions {
+        let ws = WsGate::client(Auth::Key(key)).await;
+        assert!(
+            ws.rejection().is_none(),
+            "session {n} of {max_sessions} was refused: {:?}",
+            ws.rejection()
+        );
+        sessions.push(ws);
+    }
+
+    let over = WsGate::client(Auth::Key(key)).await;
+    let refused = over
+        .rejection()
+        .expect("a session over the limit was authorized");
+    refused.assert_status(StatusCode::FORBIDDEN);
+    assert_eq!(refused.error_msg.as_deref(), Some("Too many sessions"));
+
+    // other keys are not affected
+    let other = WsGate::client(Auth::Key(other_key().await)).await;
+    assert!(
+        other.rejection().is_none(),
+        "another key's session was refused"
+    );
+
+    // the gate frees a session once it notices the connection is gone
+    drop(sessions.pop());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ws = WsGate::client(Auth::Key(key)).await;
+        if ws.rejection().is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closing a session did not free it"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Two connections (different keys) in separate tasks of a multi-threaded runtime send signed
