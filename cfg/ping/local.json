@@ -9,7 +9,7 @@
     "topicTypes": ["open", "public"]
   },
   "iggy": {
-    "url": "iggy://iggy:Secret123!@localhost:8081",
+    "url": "iggy+quic://iggy:Secret123!@localhost:8080",
     "streamPrefix": "api-gate-stream"
   },
   "redis": {

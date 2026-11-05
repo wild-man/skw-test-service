@@ -378,10 +378,17 @@ async fn rejected_client_ignoring_close_is_disconnected() {
     raw.send_text("not a request".into())
         .await
         .expect("ws send failed");
-    let close = raw
-        .next_frame(Instant::now() + Duration::from_secs(10))
-        .await
-        .expect("gate did not answer the invalid frame");
+    // a heartbeat ping may come first; the answer to the invalid frame is the next other frame
+    let answer_deadline = Instant::now() + Duration::from_secs(10);
+    let close = loop {
+        let frame = raw
+            .next_frame(answer_deadline)
+            .await
+            .expect("gate did not answer the invalid frame");
+        if !frame.is_ping() {
+            break frame;
+        }
+    };
     assert_eq!(
         close.close_code(),
         Some(CLOSE_POLICY),

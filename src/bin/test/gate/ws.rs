@@ -373,6 +373,7 @@ fn closed(frame: Option<CloseFrame>) -> WsError {
 
 const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_CLOSE: u8 = 0x8;
+const OPCODE_PING: u8 = 0x9;
 
 /// A server frame as sent on the wire.
 #[derive(Debug)]
@@ -388,6 +389,10 @@ impl RawFrame {
 
     pub fn is_close(&self) -> bool {
         self.opcode == OPCODE_CLOSE
+    }
+
+    pub fn is_ping(&self) -> bool {
+        self.opcode == OPCODE_PING
     }
 
     /// Status code of a Close frame (first two payload bytes, big-endian).
