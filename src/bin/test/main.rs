@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use skw_test_service::{find_service, listen_port};
+use skw_test_service::{CFG_DIR_ENV, cfg_dir, find_service, listen_port};
 
 const GATES: &[&str] = &["api-gate", "ws"];
 
@@ -37,7 +37,20 @@ fn main() -> ExitCode {
         }
     }
 
+    // `cargo test` runs the tests in the crate dir, so hand them the cfg dir checked above
+    let cfg_dir = match cfg_dir().and_then(|d| {
+        d.canonicalize()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", d.display()))
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[test] cfg dir: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.env(CFG_DIR_ENV, &cfg_dir);
     // `cargo run` exports per-package vars; build scripts (ring) watch them → endless rebuilds
     for (key, _) in std::env::vars_os() {
         let k = key.to_string_lossy();

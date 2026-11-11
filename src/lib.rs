@@ -8,9 +8,15 @@ use skw_lib_shared::prelude::consts::SERVICE_BIND_ADDRESS;
 
 const SERVICES_FILE: &str = "services.json";
 
-/// `./cfg` of the current dir (`services/test` when started there); `run` starts the services in
-/// the same dir, so relative paths in `cfg/` configs resolve from it.
+/// Overrides `./cfg`; the `test` binary sets it for `cargo test`, which runs the tests in the crate dir.
+pub const CFG_DIR_ENV: &str = "SKW_CFG_DIR";
+
+/// `$SKW_CFG_DIR` if set, otherwise `./cfg` of the current dir; `run` starts the services in the
+/// current dir, so relative paths in `cfg/` configs resolve from it.
 pub fn cfg_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(CFG_DIR_ENV).filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     let dir = std::env::current_dir().context("current path")?;
 
     Ok(dir.join("cfg"))
