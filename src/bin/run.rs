@@ -6,53 +6,28 @@
 //! Developer's responsibility beforehand: infra (iggy, postgres, redis, rabbitmq) running,
 //! binaries built (`cargo build`), migrations applied.
 //!
-//! Also serves the workspace `frontend/` folder over https on `FRONTEND_BIND_ADDRESS`
-//! (default `127.0.0.1:8000`) with the gates' self-signed cert (`conf/skw-api-gate.*.pem`), so
-//! pages can talk to the gates from a browser (api-gate allows this origin via `/service/cors`).
+//! Needs no cargo: binaries are taken from `SKW_BIN_DIR` (required, e.g. `../../target/debug`;
+//! relative to the CWD of `run`), configs from `./cfg`. Every service runs with the CWD of `run`,
+//! so relative paths in `cfg/` configs (tls certs, `frontend/`) resolve from there.
 
-use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::{
-    Router,
-    http::{HeaderValue, header},
-};
-use axum_server::{
-    Server,
-    tls_rustls::{RustlsAcceptor, RustlsConfig},
-};
-use serde_json::Value;
 use skw_lib_shared::prelude::consts::CONFIG_FILE_ENV;
-use skw_test_service::{ServiceEntry, crate_dir, listen_port, load_services};
+use skw_test_service::{ServiceEntry, listen_port, load_services};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
-use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
-const FRONTEND_BIND_ADDRESS_ENV: &str = "FRONTEND_BIND_ADDRESS";
-const FRONTEND_DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
-/// workspace-relative; same cert as the gates (SAN: localhost, 127.0.0.1)
-const FRONTEND_TLS_CERT: &str = "conf/skw-api-gate.cert.pem";
-const FRONTEND_TLS_KEY: &str = "conf/skw-api-gate.key.pem";
+/// directory holding the service binaries (required)
+const BIN_DIR_ENV: &str = "SKW_BIN_DIR";
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-
-struct Workspace {
-    target_dir: PathBuf,
-    /// bin name → crate dir
-    bins: HashMap<String, PathBuf>,
-}
-
-impl Workspace {
-    fn bin_path(&self, bin: &str) -> PathBuf {
-        self.target_dir.join("debug").join(bin)
-    }
-}
 
 struct Running {
     bin: String,
@@ -62,32 +37,17 @@ struct Running {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let bin_dir = bin_dir()?;
     let services = load_services()?;
-    let ws = workspace()?;
-
-    let mut daemons = vec![];
-    for s in &services {
-        let crate_dir = ws
-            .bins
-            .get(&s.bin)
-            .ok_or_else(|| anyhow!("services.json: no workspace binary named {}", s.bin))?;
-        if !ws.bin_path(&s.bin).exists() {
-            bail!(
-                "{} is not built ({}); run `cargo build` first",
-                s.bin,
-                ws.bin_path(&s.bin).display()
-            );
-        }
-        daemons.push((s, crate_dir.as_path()));
-    }
-
-    // bound before any service is spawned, so a busy port fails fast
-    let frontend = frontend_server().await?;
-    tokio::spawn(serve_frontend(frontend));
+    // every binary checked before anything is spawned
+    let daemons = services
+        .iter()
+        .map(|s| Ok((s, bin_path(&bin_dir, &s.bin)?)))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut running: Vec<Running> = vec![];
     let started = tokio::select! {
-        r = start_all(&ws, &daemons, &mut running) => r,
+        r = start_all(&daemons, &mut running) => r,
         _ = shutdown_signal() => Err(anyhow!("interrupted during startup")),
     };
 
@@ -105,9 +65,9 @@ async fn main() -> Result<()> {
     started
 }
 
-async fn start_all(ws: &Workspace, daemons: &[(&ServiceEntry, &Path)], running: &mut Vec<Running>) -> Result<()> {
-    for (s, crate_dir) in daemons {
-        let child = spawn(ws, s, crate_dir)?;
+async fn start_all(daemons: &[(&ServiceEntry, PathBuf)], running: &mut Vec<Running>) -> Result<()> {
+    for (s, bin) in daemons {
+        let child = spawn(s, bin)?;
         running.push(Running {
             bin: s.bin.clone(),
             child,
@@ -136,55 +96,6 @@ async fn start_all(ws: &Workspace, daemons: &[(&ServiceEntry, &Path)], running: 
         }
     }
     Ok(())
-}
-
-fn workspace_dir() -> PathBuf {
-    crate_dir().join("../..")
-}
-
-fn frontend_dir() -> PathBuf {
-    workspace_dir().join("frontend")
-}
-
-async fn frontend_server() -> Result<Server<std::net::SocketAddr, RustlsAcceptor>> {
-    let addr = std::env::var(FRONTEND_BIND_ADDRESS_ENV).unwrap_or_else(|_| FRONTEND_DEFAULT_BIND_ADDRESS.into());
-    let dir = frontend_dir();
-    if !dir.is_dir() {
-        bail!("frontend dir {} not found", dir.display());
-    }
-
-    // the build may enable both rustls backends (gates use aws-lc-rs), so pick one explicitly
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let tls = RustlsConfig::from_pem_file(
-        workspace_dir().join(FRONTEND_TLS_CERT),
-        workspace_dir().join(FRONTEND_TLS_KEY),
-    )
-    .await
-    .with_context(|| format!("frontend: load {FRONTEND_TLS_CERT} / {FRONTEND_TLS_KEY}"))?;
-
-    let listener = std::net::TcpListener::bind(&addr).with_context(|| format!("frontend: bind {addr}"))?;
-    listener.set_nonblocking(true)?;
-    let server = axum_server::from_tcp_rustls(listener, tls)?;
-
-    println!(
-        "[frontend] serving {} on https://{addr}/",
-        dir.canonicalize().unwrap_or(dir).display()
-    );
-    Ok(server)
-}
-
-/// Static files of `frontend/` (`index.html` for directories), never cached so edits show up on reload.
-async fn serve_frontend(server: Server<std::net::SocketAddr, RustlsAcceptor>) {
-    let app = Router::new()
-        .fallback_service(ServeDir::new(frontend_dir()))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ));
-
-    if let Err(e) = server.serve(app.into_make_service()).await {
-        eprintln!("[frontend] server stopped: {e}");
-    }
 }
 
 /// Reports crashed services; returns when none is left running.
@@ -234,10 +145,9 @@ async fn shutdown(running: &mut [Running]) {
     }
 }
 
-fn spawn(ws: &Workspace, service: &ServiceEntry, crate_dir: &Path) -> Result<Child> {
-    let mut child = Command::new(ws.bin_path(&service.bin))
-        // CWD = crate dir: relative paths in configs (e.g. tls certs) resolve from there
-        .current_dir(crate_dir)
+fn spawn(service: &ServiceEntry, bin: &Path) -> Result<Child> {
+    // CWD inherited from `run`: relative paths in cfg/ configs (e.g. tls certs) resolve from there
+    let mut child = Command::new(bin)
         .env("ENV", "local") // cfg/ holds copies of the crates' local.json
         .env(CONFIG_FILE_ENV, &service.config)
         .env(
@@ -274,45 +184,34 @@ async fn forward(stream: impl AsyncRead + Unpin, prefix: String, to_stderr: bool
     }
 }
 
-/// Locates binaries and their crate dirs via `cargo metadata` (read-only, nothing is built).
-fn workspace() -> Result<Workspace> {
-    let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .current_dir(crate_dir())
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .output()
-        .context("spawn cargo metadata")?;
-    if !out.status.success() {
+/// `SKW_BIN_DIR`, made absolute; `run` refuses to start without it.
+fn bin_dir() -> Result<PathBuf> {
+    let Some(dir) = std::env::var_os(BIN_DIR_ENV).filter(|d| !d.is_empty()) else {
+        bail!("{BIN_DIR_ENV} is not set; point it at the dir of the built binaries, e.g. {BIN_DIR_ENV}=../../target/debug");
+    };
+    let dir = PathBuf::from(dir);
+    let abs = dir
+        .canonicalize()
+        .with_context(|| format!("{BIN_DIR_ENV} {}", dir.display()))?;
+    if !abs.is_dir() {
+        bail!("{BIN_DIR_ENV} {} is not a directory", dir.display());
+    }
+    Ok(abs)
+}
+
+/// The executable for a `services.json` `bin`: a plain file name (no path) of an executable file in `bin_dir`.
+fn bin_path(bin_dir: &Path, bin: &str) -> Result<PathBuf> {
+    let is_plain_name = !bin.is_empty() && Path::new(bin).file_name().is_some_and(|n| n == bin);
+    if !is_plain_name || bin.starts_with('.') {
+        bail!("services.json: invalid bin {bin:?}, expected a binary file name");
+    }
+    let path = bin_dir.join(bin);
+    let meta = std::fs::metadata(&path).with_context(|| format!("services.json: bin {bin}: {} not found", path.display()))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
         bail!(
-            "cargo metadata failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            "services.json: bin {bin}: {} is not an executable file",
+            path.display()
         );
     }
-    let meta: Value = serde_json::from_slice(&out.stdout).context("parse cargo metadata")?;
-
-    let mut ws = Workspace {
-        target_dir: meta["target_directory"]
-            .as_str()
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("cargo metadata: no target_directory"))?,
-        bins: HashMap::new(),
-    };
-
-    for pkg in meta["packages"].as_array().into_iter().flatten() {
-        let crate_dir = Path::new(pkg["manifest_path"].as_str().unwrap_or_default())
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-
-        for target in pkg["targets"].as_array().into_iter().flatten() {
-            let is_bin = target["kind"]
-                .as_array()
-                .is_some_and(|k| k.iter().any(|k| k == "bin"));
-            let Some(name) = target["name"].as_str().filter(|_| is_bin) else {
-                continue;
-            };
-            ws.bins.insert(name.to_string(), crate_dir.clone());
-        }
-    }
-
-    Ok(ws)
+    Ok(path)
 }

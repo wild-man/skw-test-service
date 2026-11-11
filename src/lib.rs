@@ -8,13 +8,12 @@ use skw_lib_shared::prelude::consts::SERVICE_BIND_ADDRESS;
 
 const SERVICES_FILE: &str = "services.json";
 
-/// `services/test` crate dir
-pub fn crate_dir() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-}
+/// `./cfg` of the current dir (`services/test` when started there); `run` starts the services in
+/// the same dir, so relative paths in `cfg/` configs resolve from it.
+pub fn cfg_dir() -> Result<PathBuf> {
+    let dir = std::env::current_dir().context("current path")?;
 
-pub fn cfg_dir() -> PathBuf {
-    crate_dir().join("cfg")
+    Ok(dir.join("cfg"))
 }
 
 /// One entry of `cfg/services.json`; array order is the start order.
@@ -33,7 +32,8 @@ pub fn read_json(path: &Path) -> Result<Value> {
 }
 
 pub fn load_services() -> Result<Vec<ServiceEntry>> {
-    let path = cfg_dir().join(SERVICES_FILE);
+    let cfg_dir = cfg_dir()?;
+    let path = cfg_dir.join(SERVICES_FILE);
     let list = read_json(&path)?;
     let entries = list
         .as_array()
@@ -50,7 +50,7 @@ pub fn load_services() -> Result<Vec<ServiceEntry>> {
                 .ok_or_else(|| anyhow!("{SERVICES_FILE}: {bin} has no \"config\""))?;
             Ok(ServiceEntry {
                 bin: bin.to_string(),
-                config: cfg_dir().join(config),
+                config: cfg_dir.join(config),
                 listens: e["listens"].as_bool().unwrap_or(false),
             })
         })

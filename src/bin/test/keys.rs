@@ -39,7 +39,7 @@ impl ApiKey {
         let resp = http_client()
             .post(api_gate_url("/auth/open"))
             .body(gate_body(&auth::RpcMethod::CreateKey {
-                store_private_key: false,
+                store_private_key: true,
             }))
             .send()
             .await

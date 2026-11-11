@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use skw_test_service::{crate_dir, find_service, listen_port};
+use skw_test_service::{find_service, listen_port};
 
 const GATES: &[&str] = &["api-gate", "ws"];
 
@@ -53,8 +53,8 @@ fn main() -> ExitCode {
     }
 
     let status = cmd
-        .current_dir(crate_dir())
-        .args(["test", "--bin", "test", "--"])
+        // from the current dir; `-p` so it works from any dir inside the workspace
+        .args(["test", "-p", "skw-test-service", "--bin", "test", "--"])
         .args(std::env::args().skip(1))
         .status();
 
